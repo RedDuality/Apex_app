@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'connection_service.dart';
+import 'archive_service.dart';
 
 // ── Sensor palette ────────────────────────────────────────────────────────────
 const List<Color> kSensorColors = [
@@ -18,7 +19,8 @@ const List<Color> kSensorColors = [
 
 class MainPage extends StatelessWidget {
   final ConnectionService bleService;
-  const MainPage({super.key, required this.bleService});
+  final ArchiveService archiveService;
+  const MainPage({super.key, required this.bleService, required this.archiveService});
 
   @override
   Widget build(BuildContext context) {
@@ -46,7 +48,10 @@ class MainPage extends StatelessWidget {
           ),
           // ── Legend ───────────────────────────────────────────────────────
           _SensorLegend(statusStream: bleService.statusStream),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
+          // ── Recording bar ────────────────────────────────────────────────
+          _RecordingBar(archiveService: archiveService),
+          const SizedBox(height: 14),
         ],
       ),
     );
@@ -494,4 +499,241 @@ class _GraphPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_GraphPainter old) => true;
+}
+
+// ── Recording bar ─────────────────────────────────────────────────────────────
+
+class _RecordingBar extends StatefulWidget {
+  final ArchiveService archiveService;
+  const _RecordingBar({required this.archiveService});
+
+  @override
+  State<_RecordingBar> createState() => _RecordingBarState();
+}
+
+class _RecordingBarState extends State<_RecordingBar> {
+  Timer? _clockTicker;
+  Duration _elapsed = Duration.zero;
+  DateTime? _startTime;
+
+  // ── Pulse animation for the red dot ──────────────────────────────────────
+  bool _dotVisible = true;
+  Timer? _blinkTicker;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.archiveService.isRecording.addListener(_onRecordingChanged);
+  }
+
+  void _onRecordingChanged() {
+    final recording = widget.archiveService.isRecording.value;
+    if (recording) {
+      _startTime = DateTime.now();
+      _elapsed = Duration.zero;
+      _clockTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) {
+          setState(() => _elapsed = DateTime.now().difference(_startTime!));
+        }
+      });
+      _blinkTicker = Timer.periodic(const Duration(milliseconds: 600), (_) {
+        if (mounted) setState(() => _dotVisible = !_dotVisible);
+      });
+    } else {
+      _clockTicker?.cancel();
+      _blinkTicker?.cancel();
+      _dotVisible = true;
+      if (mounted) setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.archiveService.isRecording.removeListener(_onRecordingChanged);
+    _clockTicker?.cancel();
+    _blinkTicker?.cancel();
+    super.dispose();
+  }
+
+  String _formatElapsed(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
+  Future<void> _handleStop() async {
+    try {
+      final path = await widget.archiveService.stopRecording();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFF238636),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          duration: const Duration(seconds: 6),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Recording saved',
+                style: TextStyle(fontWeight: FontWeight.w600, color: Colors.white),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                path,
+                style: const TextStyle(fontSize: 11, color: Color(0xFFABD5B4)),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: const Color(0xFFCF222E),
+          content: Text('Export failed: $e'),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: widget.archiveService.isRecording,
+      builder: (context, recording, _) {
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 12),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: const Color(0xFF161B22),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: recording
+                  ? const Color(0xFFCF222E).withValues(alpha: 0.5)
+                  : const Color(0xFF30363D),
+              width: 0.8,
+            ),
+          ),
+          child: Row(
+            children: [
+              // ── Left: status indicator ──────────────────────────────────
+              if (recording) ...[
+                AnimatedOpacity(
+                  opacity: _dotVisible ? 1.0 : 0.15,
+                  duration: const Duration(milliseconds: 200),
+                  child: Container(
+                    width: 8,
+                    height: 8,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFFCF222E),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'REC  ${_formatElapsed(_elapsed)}',
+                  style: const TextStyle(
+                    color: Color(0xFFCF222E),
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    fontFamily: 'monospace',
+                    letterSpacing: 1,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                // Packet counter
+                ValueListenableBuilder<int>(
+                  valueListenable: widget.archiveService.packetCount,
+                  builder: (_, count, _) => Text(
+                    '$count pkts',
+                    style: const TextStyle(
+                      color: Color(0xFF8B949E),
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              ] else ...[
+                const Icon(Icons.fiber_manual_record_outlined,
+                    size: 14, color: Color(0xFF8B949E)),
+                const SizedBox(width: 8),
+                const Text(
+                  'Not recording',
+                  style: TextStyle(color: Color(0xFF8B949E), fontSize: 13),
+                ),
+              ],
+
+              const Spacer(),
+
+              // ── Right: action button ────────────────────────────────────
+              if (recording)
+                _BarButton(
+                  label: 'Stop & Save',
+                  icon: Icons.stop_rounded,
+                  color: const Color(0xFFCF222E),
+                  onTap: _handleStop,
+                )
+              else
+                _BarButton(
+                  label: 'Start Recording',
+                  icon: Icons.fiber_manual_record_rounded,
+                  color: const Color(0xFF238636),
+                  onTap: () => widget.archiveService.startRecording(),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _BarButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _BarButton({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color.withValues(alpha: 0.4), width: 0.8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 14, color: color),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                color: color,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
